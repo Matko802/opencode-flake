@@ -39,3 +39,7 @@ environment.systemPackages = with pkgs; [
 ```
 
 The script queries the official update API, prefetches the new tarball hash, rewrites `version` and `hash` in `package.nix`, so the next rebuild picks up the new version.
+
+## Self update
+
+The `Machine/machine-config.nix` in `~/fish-flake` ships a systemd timer (`opencode-update.timer`) that runs nightly as root: it compares the official update API against `package.nix`, when a newer version exists it runs `update.sh`, commits and pushes the flake, then updates the `opencode` input in the system flake and runs `nixos-rebuild switch` only when the version moved, making opencode fully self updating with no curl installer involved.
