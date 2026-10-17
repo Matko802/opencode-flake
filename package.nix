@@ -17,7 +17,7 @@ stdenv.mkDerivation {
 
   installPhase = ''
     runHook preInstall
-    install -Dm755 package/bin/opencode $out/bin/opencode
+    install -Dm755 bin/opencode $out/bin/opencode
     runHook postInstall
   '';
 
