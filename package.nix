@@ -1,14 +1,14 @@
 { stdenv, lib, fetchurl, autoPatchelfHook }:
 let
   pname = "opencode";
-  version = "2.0.32";
+  version = "2.1.2";
 in
 stdenv.mkDerivation {
   inherit pname version;
 
   src = fetchurl {
     url = "https://registry.npmjs.org/@opencode/cli-linux-x64/-/cli-linux-x64-${version}.tgz";
-    hash = "sha256-ZKH0s4HC0u/BjI12ss45kUF3i0IbVMmLlL6OgIA2Btw=";
+    hash = "sha256-LhxmX16C5TFzIynyoxBmcoc0d1BuN4sX0w7qvTHRObM=";
   };
 
   nativeBuildInputs = [ autoPatchelfHook ];
