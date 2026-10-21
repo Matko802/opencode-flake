@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+export PATH="@out@/bin:$PATH"
+exec "@out@/libexec/opencode" "$@"

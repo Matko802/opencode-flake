@@ -32,6 +32,35 @@ environment.systemPackages = with pkgs; [
 ];
 ```
 
+## In-app /update
+
+The package ships a `package.json` beside the real binary (which lives in
+`libexec/opencode`) plus a tiny `npm` shim, so OpenCode's own updater detects
+the install as `npm` and `/update` (and `opencode upgrade`) reach our code:
+
+- `npm list -g --depth=0 @opencode/cli` reports the packaged version
+- `npm install --global --force @opencode/cli@<v>` updates the flake source
+  package and installs it into the nix user profile (`~/.nix-profile`) via
+  `nix profile install` — no package manager, no root
+- `npm uninstall --global @opencode/cli` removes the profile entry
+
+Everything else npm is forwarded untouched to the real `npm` on PATH.
+
+Update source resolution, in order: `$OPENCODE_FLAKE` (a checkout of this
+repo), a previously discovered checkout cached in
+`~/.cache/opencode/flake-dir`, a shallow scan of `$HOME` for a directory
+ending in `opencode-flake`, and finally
+`github:Matko802/opencode-flake` — which only works once the new version has
+been pushed. When a local checkout is used the source `package.nix` is
+rewritten (same logic as `./update.sh`), so the change is visible in `git`
+waiting to be committed and pushed.
+
+After an in-app update the new binary runs from `~/.nix-profile/bin/opencode`
+(earlier in PATH than `/etc/profiles`). The `systemPackages` copy only moves
+through the normal NixOS rebuild; once it catches up, clean up the profile
+entry with `nix profile remove opencode`. To silence the periodic update
+prompt instead, set `OPENCODE_DISABLE_AUTOUPDATE=1`.
+
 ## Update to a newer release
 
 ```bash

@@ -17,8 +17,26 @@ stdenv.mkDerivation {
 
   installPhase = ''
     runHook preInstall
-    install -Dm755 bin/opencode $out/bin/opencode
+    install -Dm755 bin/opencode $out/libexec/opencode
+    mkdir -p $out/bin $out/libexec
+    substitute ${./wrapper/opencode} $out/bin/opencode --subst-var out
+    substitute ${./wrapper/npm} $out/bin/npm --subst-var out --subst-var-by version ${version}
+    substitute ${./wrapper/upgrade} $out/libexec/upgrade --subst-var out
+    chmod +x $out/bin/opencode $out/bin/npm $out/libexec/upgrade
+    cat > $out/package.json <<'JSON'
+{
+  "name": "@opencode/cli",
+  "version": "${version}",
+  "bin": {
+    "opencode": "libexec/opencode"
+  }
+}
+JSON
     runHook postInstall
+  '';
+
+  postFixup = ''
+    patchShebangs $out/bin $out/libexec
   '';
 
   meta = with lib; {
