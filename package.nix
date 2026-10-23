@@ -1,59 +1,76 @@
-{ stdenv, lib, fetchurl, autoPatchelfHook }:
+{
+  lib,
+  stdenv,
+  makeWrapper,
+  curl,
+  gnutar,
+  gzip,
+  gnugrep,
+  gnused,
+  coreutils,
+  patchelf,
+  glibc,
+}:
 let
-  pname = "opencode";
-  version = "2.1.4";
+  runtimeInputs = [
+    curl
+    gnutar
+    gzip
+    gnugrep
+    gnused
+    coreutils
+    patchelf
+  ];
+  loader =
+    if stdenv.hostPlatform.isAarch64 then
+      "${glibc}/lib/ld-linux-aarch64.so.1"
+    else
+      "${glibc}/lib/ld-linux-x86-64.so.2";
+  wrapperArgs = [
+    "--prefix"
+    "PATH"
+    ":"
+    "${lib.makeBinPath runtimeInputs}"
+    "--set"
+    "OPENCODE_NIX_LOADER"
+    loader
+  ];
 in
 stdenv.mkDerivation {
-  inherit pname version;
+  pname = "opencode";
+  version = "rolling";
 
-  src = fetchurl {
-    url = "https://registry.npmjs.org/@opencode/cli-linux-x64/-/cli-linux-x64-${version}.tgz";
-    hash = "sha256-zgWr4tzhBBORyOyM242gZvZA/UcecqyEbcsInEQeEeE=";
-  };
+  dontUnpack = true;
 
-  nativeBuildInputs = [ autoPatchelfHook ];
-
-  dontStrip = true;
+  nativeBuildInputs = [ makeWrapper ];
 
   installPhase = ''
     runHook preInstall
-    install -Dm755 bin/opencode $out/libexec/opencode
-    mkdir -p $out/bin $out/libexec
-    substitute ${./wrapper/opencode} $out/bin/opencode --subst-var out
-    substitute ${./wrapper/npm} $out/bin/npm --subst-var out --subst-var-by version ${version}
-    substitute ${./wrapper/upgrade} $out/libexec/upgrade --subst-var out
-    chmod +x $out/bin/opencode $out/bin/npm $out/libexec/upgrade
-    cat > $out/package.json <<'JSON'
-{
-  "name": "@opencode/cli",
-  "version": "${version}",
-  "bin": {
-    "opencode": "libexec/opencode"
-  }
-}
-JSON
-    mkdir -p $out/share/opencode-flake
-    cp -r ${./.}/. $out/share/opencode-flake/
+    install -Dm755 ${./wrapper/opencode} $out/bin/opencode
+    patchShebangs $out/bin/opencode
+    wrapProgram $out/bin/opencode ${lib.escapeShellArgs wrapperArgs}
+    install -Dm755 ${./wrapper/opencode} $out/bin/opencode-manager
+    patchShebangs $out/bin/opencode-manager
+    wrapProgram $out/bin/opencode-manager ${lib.escapeShellArgs wrapperArgs} --set OPENCODE_MANAGER_MODE 1
     runHook postInstall
   '';
 
-  postFixup = ''
-    patchShebangs $out/bin $out/libexec
-  '';
-
   meta = with lib; {
-    description = "OpenCode terminal coding agent, packaged from the upstream binary tarball the official installer downloads";
+    description = "Self-updating OpenCode launcher that fetches releases outside the Nix store";
     longDescription = ''
-      opencode packaged from the official upstream binary tarball published on
-      the npm registry instead of nixpkgs, matching what the official
-      `curl https://opencode.ai/v2/install | bash` installer puts in
-      ~/.opencode/bin.
+      Installs a small manager as the `opencode` command. The manager downloads
+      the official OpenCode release tarball from the npm registry into
+      `~/.opencode` on first run, checks for updates before each launch, and
+      asks before installing a newer release. The OpenCode binary itself is not
+      part of the Nix derivation.
     '';
     homepage = "https://opencode.ai";
     downloadPage = "https://www.npmjs.com/package/@opencode/cli-linux-x64";
     license = licenses.mit;
-    platforms = [ "x86_64-linux" ];
-    sourceProvenance = with sourceTypes; [ binaryNativeCode ];
+    platforms = [
+      "x86_64-linux"
+      "aarch64-linux"
+    ];
     mainProgram = "opencode";
     maintainers = [ ];
   };

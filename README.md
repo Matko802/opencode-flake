@@ -1,16 +1,26 @@
 # opencode-flake
 
-OpenCode terminal coding agent packaged from the official upstream binary tarball that the `curl https://opencode.ai/v2/install | bash` installer downloads.
+A small Nix package that installs a self-updating OpenCode launcher. The Nix
+store only contains the manager script; the actual OpenCode binary is fetched
+from the official release tarball into `~/.opencode` on first run.
 
 - Upstream: https://github.com/sst/opencode
-- Tarball: `@opencode/cli-linux-x64` from the npm registry
-- Binary: `opencode`
-- Platform: `x86_64-linux`
+- Tarball: official `@opencode/cli-<platform>` tarballs from the npm registry
+- Manager install dir: `${OPENCODE_HOME:-~/.opencode}`
+- Platforms: `x86_64-linux`, `aarch64-linux`
 
 ## Try it
 
 ```bash
 nix run github:Matko802/opencode-flake
+```
+
+On first run the manager downloads the latest release, verifies that it runs,
+patches its ELF interpreter with the flake's glibc when necessary, and starts
+it. On later runs it checks the official update API and asks before updating:
+
+```text
+opencode 2.1.4 is available (installed 2.1.3). Update? [y/N]
 ```
 
 ## Use in your NixOS flake
@@ -32,49 +42,34 @@ environment.systemPackages = with pkgs; [
 ];
 ```
 
-## In-app /update
-
-The package ships a `package.json` beside the real binary (which lives in
-`libexec/opencode`) plus a tiny `npm` shim, so OpenCode's own updater detects
-the install as `npm` and `/update` (and `opencode upgrade`) reach our code:
-
-- `npm list -g --depth=0 @opencode/cli` reports the packaged version
-- `npm install --global --force @opencode/cli@<v>` updates the flake source
-  package and installs it into the nix user profile (`~/.nix-profile`) via
-  `nix profile install` — no package manager, no root
-- `npm uninstall --global @opencode/cli` removes the profile entry
-
-Everything else npm is forwarded untouched to the real `npm` on PATH.
-
-Update source resolution, in order: `$OPENCODE_FLAKE` (a checkout of this
-repo), a previously discovered checkout cached in
-`~/.cache/opencode/flake-dir` (also written by `./update.sh`), the current
-directory and its parents, and a shallow scan of `$HOME` plus `/mnt`,
-`/media`, `/srv` and `/opt` for a directory ending in `opencode-flake`. When
-a local checkout is used the source `package.nix` is rewritten (same logic as
-`./update.sh`), so the change is visible in `git` waiting to be committed and
-pushed.
-
-When no checkout can be found, the updater copies the flake source bundled
-with the installed package to `~/.local/share/opencode/flake`, bumps that
-copy, and installs from it. Updates therefore work even while
-`github:Matko802/opencode-flake` still points at an older version; set
-`OPENCODE_FLAKE` if you want the real checkout updated instead.
-
-After an in-app update the new binary runs from `~/.nix-profile/bin/opencode`
-(earlier in PATH than `/etc/profiles`). The `systemPackages` copy only moves
-through the normal NixOS rebuild; once it catches up, clean up the profile
-entry with `nix profile remove opencode`. To silence the periodic update
-prompt instead, set `OPENCODE_DISABLE_AUTOUPDATE=1`.
-
-## Update to a newer release
+## Manager commands
 
 ```bash
-./update.sh
+opencode-manager status          # show installed and latest versions
+opencode-manager update          # install the latest version now
+opencode-manager install 2.1.4   # install a specific version
+opencode-manager check           # exit 0 when an update is available
+opencode-manager version         # print the installed version
+opencode-manager path            # print the installed binary path
 ```
 
-The script queries the official update API, prefetches the new tarball hash, rewrites `version` and `hash` in `package.nix`, so the next rebuild picks up the new version.
+## Environment
 
-## Self update
+- `OPENCODE_NO_UPDATE=1` — skip the update check.
+- `OPENCODE_AUTO_UPDATE=1` — update without asking.
+- `OPENCODE_HOME=/path` — where the binary and version file live
+  (default `~/.opencode`).
+- `OPENCODE_UPDATE_API=url` — override the update API endpoint.
 
-The `Machine/machine-config.nix` in `~/fish-flake` ships a systemd timer (`opencode-update.timer`) that runs nightly as root: it compares the official update API against `package.nix`, when a newer version exists it runs `update.sh`, commits and pushes the flake, then updates the `opencode` input in the system flake and runs `nixos-rebuild switch` only when the version moved, making opencode fully self updating with no curl installer involved.
+The manager sets `OPENCODE_DISABLE_AUTOUPDATE=1` for the child process so
+OpenCode's built-in updater does not conflict with it.
+
+## Notes
+
+- The binary lives outside the Nix store, so it is not reproducible and Nix
+  cannot roll it back. Nix rebuilds only change the manager, not OpenCode.
+- The flake does not need to be updated for new OpenCode releases.
+- The old `update.sh` script and the nightly self-update timer are obsolete;
+  remove the timer if it is still installed.
+- To uninstall, remove `opencode` from `systemPackages` or the profile, then
+  delete the managed install: `rm -rf ~/.opencode`.
