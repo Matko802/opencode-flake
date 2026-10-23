@@ -48,12 +48,18 @@ Everything else npm is forwarded untouched to the real `npm` on PATH.
 
 Update source resolution, in order: `$OPENCODE_FLAKE` (a checkout of this
 repo), a previously discovered checkout cached in
-`~/.cache/opencode/flake-dir`, a shallow scan of `$HOME` for a directory
-ending in `opencode-flake`, and finally
-`github:Matko802/opencode-flake` — which only works once the new version has
-been pushed. When a local checkout is used the source `package.nix` is
-rewritten (same logic as `./update.sh`), so the change is visible in `git`
-waiting to be committed and pushed.
+`~/.cache/opencode/flake-dir` (also written by `./update.sh`), the current
+directory and its parents, and a shallow scan of `$HOME` plus `/mnt`,
+`/media`, `/srv` and `/opt` for a directory ending in `opencode-flake`. When
+a local checkout is used the source `package.nix` is rewritten (same logic as
+`./update.sh`), so the change is visible in `git` waiting to be committed and
+pushed.
+
+When no checkout can be found, the updater copies the flake source bundled
+with the installed package to `~/.local/share/opencode/flake`, bumps that
+copy, and installs from it. Updates therefore work even while
+`github:Matko802/opencode-flake` still points at an older version; set
+`OPENCODE_FLAKE` if you want the real checkout updated instead.
 
 After an in-app update the new binary runs from `~/.nix-profile/bin/opencode`
 (earlier in PATH than `/etc/profiles`). The `systemPackages` copy only moves

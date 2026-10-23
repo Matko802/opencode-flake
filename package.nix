@@ -1,14 +1,14 @@
 { stdenv, lib, fetchurl, autoPatchelfHook }:
 let
   pname = "opencode";
-  version = "2.1.2";
+  version = "2.1.4";
 in
 stdenv.mkDerivation {
   inherit pname version;
 
   src = fetchurl {
     url = "https://registry.npmjs.org/@opencode/cli-linux-x64/-/cli-linux-x64-${version}.tgz";
-    hash = "sha256-LhxmX16C5TFzIynyoxBmcoc0d1BuN4sX0w7qvTHRObM=";
+    hash = "sha256-zgWr4tzhBBORyOyM242gZvZA/UcecqyEbcsInEQeEeE=";
   };
 
   nativeBuildInputs = [ autoPatchelfHook ];
@@ -32,6 +32,8 @@ stdenv.mkDerivation {
   }
 }
 JSON
+    mkdir -p $out/share/opencode-flake
+    cp -r ${./.}/. $out/share/opencode-flake/
     runHook postInstall
   '';
 

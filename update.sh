@@ -6,5 +6,8 @@ URL="https://registry.npmjs.org/@opencode/cli-linux-x64/-/cli-linux-x64-${VERSIO
 HASH=$(nix store prefetch-file --json "$URL" | python3 -c "import json, sys; print(json.load(sys.stdin)['hash'])")
 sed -i -E "s/version = \"[^\"]+\";/version = \"${VERSION}\";/" package.nix
 sed -i -E "s|hash = \"sha256-[A-Za-z0-9+/=]+\";|hash = \"${HASH}\";|" package.nix
+cache="${XDG_CACHE_HOME:-$HOME/.cache}/opencode"
+mkdir -p "$cache"
+printf '%s\n' "$(pwd -P)" > "$cache/flake-dir"
 echo "Updated to ${VERSION} ${HASH}"
 echo "Rebuild to apply: nix run . or nixos-rebuild with the overlay"

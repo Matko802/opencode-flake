@@ -1,9 +1,35 @@
 #!/usr/bin/env bash
 set -euo pipefail
 pkgname="@opencode/cli"
+cache="${XDG_CACHE_HOME:-$HOME/.cache}/opencode"
+staging="${XDG_DATA_HOME:-$HOME/.local/share}/opencode/flake"
+
 latest() {
   curl -fsSL "https://opencode.ai/update/api/latest/cli/npm" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p'
 }
+
+is_flake() {
+  [ -n "${1:-}" ] && [ -f "$1/package.nix" ] && grep -q "@opencode/cli-linux-x64" "$1/package.nix"
+}
+
+remember() {
+  mkdir -p "$cache" 2>/dev/null || return 0
+  printf '%s\n' "$1" > "$cache/flake-dir" 2>/dev/null || return 0
+}
+
+find_candidates() {
+  local roots=("$HOME") root
+  for root in /mnt /media /run/media /srv /opt; do
+    if [ -d "$root" ]; then roots+=("$root"); fi
+  done
+  timeout 20 find "${roots[@]}" -maxdepth 6 \
+    \( -name .cache -o -name .local -o -name .npm -o -name .cargo -o -name .rustup \
+    -o -name node_modules -o -name .opencode -o -name .config -o -name .ssh \
+    -o -name .steam -o -name .var -o -name .gnupg -o -name .pki -o -name .dbus \
+    -o -name .git -o -name target -o -name result \) -prune -o \
+    -type d -name opencode-flake -print 2>/dev/null || true
+}
+
 target="${1:-}"
 case "$target" in
   remove)
@@ -28,44 +54,50 @@ if [ -z "$hash" ]; then
   echo "npm error opencode: could not prefetch hash for ${version}" >&2
   exit 1
 fi
-flake="${OPENCODE_FLAKE:-}"
-cache="${XDG_CACHE_HOME:-$HOME/.cache}/opencode"
-if [ -z "$flake" ] && [ -f "$cache/flake-dir" ]; then
-  candidate="$(cat "$cache/flake-dir")"
-  if [ -f "$candidate/package.nix" ] && grep -q "@opencode/cli-linux-x64" "$candidate/package.nix"; then
-    flake="$candidate"
-  fi
+flake=""
+if is_flake "${OPENCODE_FLAKE:-}"; then
+  flake="$OPENCODE_FLAKE"
+elif [ -f "$cache/flake-dir" ] && is_flake "$(cat "$cache/flake-dir")"; then
+  flake="$(cat "$cache/flake-dir")"
+fi
+if [ -z "$flake" ]; then
+  dir="$PWD"
+  while :; do
+    if is_flake "$dir"; then flake="$dir"; break; fi
+    [ "$dir" = "/" ] && break
+    dir="$(dirname "$dir")"
+  done
 fi
 if [ -z "$flake" ]; then
   while IFS= read -r candidate; do
-    if [ -f "$candidate/package.nix" ] && grep -q "@opencode/cli-linux-x64" "$candidate/package.nix"; then
-      flake="$candidate"
-      mkdir -p "$cache"
-      printf '%s\n' "$candidate" > "$cache/flake-dir"
-      break
-    fi
-  done < <(find "$HOME" -maxdepth 4 \( -name .cache -o -name .local -o -name .npm -o -name .cargo -o -name .rustup -o -name node_modules -o -name .opencode -o -name .config -o -name .ssh -o -name .steam -o -name .var -o -name .gnupg -o -name .pki -o -name .dbus \) -prune -o -type d -name "opencode-flake" -print 2>/dev/null)
+    if is_flake "$candidate"; then flake="$candidate"; break; fi
+  done < <(find_candidates)
 fi
-if [ -n "$flake" ] && [ -d "$flake" ]; then
+if is_flake "$flake"; then
   flake="$(cd "$flake" && pwd)"
+  remember "$flake"
+  echo "npm notice using opencode-flake checkout at ${flake}"
 else
   flake=""
-fi
-if [ -n "$flake" ]; then
-  cd "$flake"
-  sed -i -E "s/version = \"[^\"]+\";/version = \"${version}\";/" package.nix
-  sed -i -E "s|hash = \"sha256-[A-Za-z0-9+/=]+\";|hash = \"${hash}\";|" package.nix
-  if ! grep -q "version = \"${version}\";" package.nix; then
-    echo "npm error opencode: failed to bump $flake/package.nix to ${version}" >&2
-    exit 1
-  fi
-  echo "npm notice opencode-flake source set to ${version} in ${flake}"
-  spec="${flake}#opencode"
-else
-  spec="github:Matko802/opencode-flake#opencode"
-  echo "npm notice no local opencode-flake checkout found; installing from ${spec}"
+  rm -rf "$staging"
+  mkdir -p "$(dirname "$staging")"
+  cp -r "@out@/share/opencode-flake" "$staging"
+  chmod -R u+w "$staging"
+  flake="$staging"
+  echo "npm notice no opencode-flake checkout found; using the packaged source copy at ${flake}"
   echo "npm notice set OPENCODE_FLAKE to a checkout to update the flake source automatically"
 fi
+cd "$flake"
+sed -i -E "s/version = \"[^\"]+\";/version = \"${version}\";/" package.nix
+sed -i -E "s|hash = \"sha256-[A-Za-z0-9+/=]+\";|hash = \"${hash}\";|" package.nix
+if ! grep -q "version = \"${version}\";" package.nix; then
+  echo "npm error opencode: failed to bump $flake/package.nix to ${version}" >&2
+  exit 1
+fi
+if [ "$flake" != "$staging" ]; then
+  echo "npm notice opencode-flake source set to ${version} in ${flake}"
+fi
+spec="${flake}#opencode"
 profile="$HOME/.nix-profile/bin/opencode"
 if ! nix profile install "$spec" >/dev/null 2>&1; then
   nix profile remove opencode >/dev/null 2>&1 || true
