@@ -1,5 +1,5 @@
 {
-  description = "Self-updating OpenCode launcher that fetches official releases at runtime";
+  description = "Self-updating OpenCode manager that fetches official releases at runtime";
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs?ref=nixos-unstable";
@@ -16,12 +16,12 @@
     in
     {
       packages = forAllSystems (pkgs: rec {
-        opencode = pkgs.callPackage ./package.nix { };
-        default = opencode;
+        opencode-manager = pkgs.callPackage ./package.nix { };
+        default = opencode-manager;
       });
 
       overlays.default = final: _prev: {
-        opencode = final.callPackage ./package.nix { };
+        opencode-manager = final.callPackage ./package.nix { };
       };
     };
 }

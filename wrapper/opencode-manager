@@ -1,0 +1,768 @@
+#!/usr/bin/env bash
+set -euo pipefail
+export LC_NUMERIC=C
+
+api="${OPENCODE_UPDATE_API:-https://opencode.ai/update/api/latest/cli/npm}"
+registry_base="${OPENCODE_REGISTRY:-https://registry.npmjs.org}"
+home="${OPENCODE_HOME:-${HOME:?}/.opencode}"
+bin="$home/bin/opencode"
+version_file="$home/version"
+loader="${OPENCODE_NIX_LOADER:-}"
+
+say() {
+  printf 'opencode-manager: %s\n' "$*" >&2
+}
+
+is_on() {
+  case "${1:-}" in
+    1|true|yes|on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+esc=$'\033'
+use_color=0
+if [ -t 2 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != "dumb" ]; then
+  use_color=1
+  reset="${esc}[0m"
+  bold="${esc}[1m"
+  dim="${esc}[2m"
+  accent="${esc}[38;5;45m"
+  accent2="${esc}[38;5;51m"
+  muted="${esc}[38;5;244m"
+  good="${esc}[38;5;46m"
+  bad="${esc}[38;5;196m"
+  warn="${esc}[38;5;214m"
+  sel_bg="${esc}[48;5;236m"
+else
+  reset=""
+  bold=""
+  dim=""
+  accent=""
+  accent2=""
+  muted=""
+  good=""
+  bad=""
+  warn=""
+  sel_bg=""
+fi
+
+rainbow=(196 202 208 214 220 226 190 154 118 82 46 47 48 49 50 51 45 39 33 27 21 57 93 129 165 201 207 213)
+
+unicode=0
+case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
+  *UTF-8*|*utf-8*|*UTF8*|*utf8*) unicode=1 ;;
+esac
+if [ "$unicode" = 1 ]; then
+  bar_full="█"
+  bar_empty="░"
+  spinners=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
+  ok_mark="✔"
+  fail_mark="✗"
+  pointer="❯"
+else
+  bar_full="#"
+  bar_empty="-"
+  spinners=('|' '/' '-' $'\\')
+  ok_mark="+"
+  fail_mark="x"
+  pointer=">"
+fi
+
+cursor_hidden=""
+alt_screen=""
+saved_stty=""
+tmp_dir=""
+
+cleanup() {
+  local was_alt="${alt_screen:-}"
+  if [ -n "$saved_stty" ]; then
+    stty "$saved_stty" < /dev/tty 2>/dev/null || true
+    saved_stty=""
+  fi
+  if [ -n "$alt_screen" ]; then
+    printf '%s' "${esc}[?1049l" >&2
+    alt_screen=""
+  fi
+  if [ -n "$cursor_hidden" ]; then
+    if [ -z "$was_alt" ]; then
+      printf '\r%s[K\n' "$esc" >&2
+    fi
+    printf '%s' "${esc}[?25h" >&2
+    cursor_hidden=""
+  fi
+  if [ -n "$tmp_dir" ]; then
+    rm -rf "$tmp_dir"
+    tmp_dir=""
+  fi
+}
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT TERM HUP
+
+now_us() {
+  local t="${EPOCHREALTIME:-}"
+  if [ -n "$t" ]; then
+    t="${t/./}"
+    printf '%s' "$t"
+  else
+    printf '%s' "$(( $(date +%s%N) / 1000 ))"
+  fi
+}
+
+file_size() {
+  local size
+  size="$(stat -c %s "$1" 2>/dev/null || true)"
+  case "$size" in
+    ''|*[!0-9]*) size=0 ;;
+  esac
+  printf '%s' "$size"
+}
+
+human_size() {
+  local b="${1:-0}"
+  if (( b < 0 )); then b=0; fi
+  if (( b >= 1073741824 )); then
+    printf '%d.%d GiB' $(( b / 1073741824 )) $(( (b % 1073741824) * 10 / 1073741824 ))
+  elif (( b >= 1048576 )); then
+    printf '%d.%d MiB' $(( b / 1048576 )) $(( (b % 1048576) * 10 / 1048576 ))
+  elif (( b >= 1024 )); then
+    printf '%d.%d KiB' $(( b / 1024 )) $(( (b % 1024) * 10 / 1024 ))
+  else
+    printf '%d B' "$b"
+  fi
+}
+
+human_time() {
+  local s="${1:-0}"
+  if (( s >= 60 )); then
+    printf '%dm%02ds' $(( s / 60 )) $(( s % 60 ))
+  else
+    printf '%ds' "$s"
+  fi
+}
+
+term_cols() {
+  local cols="${COLUMNS:-}" rows
+  case "$cols" in
+    ''|*[!0-9]*)
+      if ! read -r rows cols < <(stty size < /dev/tty 2>/dev/null); then
+        cols=80
+      fi
+      ;;
+  esac
+  case "$cols" in
+    ''|*[!0-9]*) cols=80 ;;
+  esac
+  if (( cols < 20 )); then cols=80; fi
+  printf '%s' "$cols"
+}
+
+gradient_text() {
+  local text="$1" offset="${2:-0}" i ch color_out out=""
+  if [ "$use_color" = 0 ]; then
+    printf '%s' "$text"
+    return 0
+  fi
+  for (( i=0; i<${#text}; i++ )); do
+    ch="${text:i:1}"
+    color_out="${rainbow[$(( (i + offset) % ${#rainbow[@]} ))]}"
+    out+="${esc}[38;5;${color_out}m${ch}"
+  done
+  printf '%s%s' "$out" "$reset"
+}
+
+spinner_wait() {
+  local pid="$1" label="$2" frame=0
+  if [ -t 2 ]; then
+    cursor_hidden=1
+    printf '%s' "${esc}[?25l" >&2
+  fi
+  while kill -0 "$pid" 2>/dev/null; do
+    printf '\r%s[K  %s%s%s %s%s%s' "$esc" "$accent" "${spinners[$(( frame % ${#spinners[@]} ))]}" "$reset" "$muted" "$label" "$reset" >&2
+    frame=$(( frame + 1 ))
+    sleep 0.08
+  done
+  printf '\r%s[K' "$esc" >&2
+  if [ -t 2 ]; then
+    cursor_hidden=""
+    printf '%s' "${esc}[?25h" >&2
+  fi
+}
+
+content_length() {
+  local headers code len
+  headers="$(mktemp "${TMPDIR:-/tmp}/opencode-manager-headers.XXXXXX")"
+  code="$(curl -fsIL --connect-timeout 10 --max-time 20 -D "$headers" -o /dev/null -w '%{http_code}' "$1" 2>/dev/null || true)"
+  len=""
+  if [ "$code" = 200 ]; then
+    len="$(tr -d '\r' < "$headers" | sed -n 's/^[Cc]ontent-[Ll]ength:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | tail -n1)"
+  fi
+  case "$len" in
+    ''|*[!0-9]*|0)
+      code="$(curl -fsSL --connect-timeout 10 --max-time 20 --range 0-0 -D "$headers" -o /dev/null -w '%{http_code}' "$1" 2>/dev/null || true)"
+      len=""
+      if [ "$code" = 206 ]; then
+        len="$(tr -d '\r' < "$headers" | sed -n 's/^[Cc]ontent-[Rr]ange:.*\/\([0-9][0-9]*\).*/\1/p' | tail -n1)"
+      elif [ "$code" = 200 ]; then
+        len="$(tr -d '\r' < "$headers" | sed -n 's/^[Cc]ontent-[Ll]ength:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | tail -n1)"
+      fi
+      ;;
+  esac
+  rm -f "$headers"
+  case "$len" in
+    ''|*[!0-9]*) len=0 ;;
+  esac
+  printf '%s' "$len"
+}
+
+render_progress() {
+  local current="$1" total="$2" speed="$3" frame="$4" offset="$5"
+  local cols width pct filled i head color_out bar pct_txt speed_txt size_txt spin mode
+  cols="${download_cols:-80}"
+  if (( cols >= 78 )); then
+    mode=full
+    width=$(( cols - 43 ))
+  elif (( cols >= 54 )); then
+    mode=medium
+    width=$(( cols - 27 ))
+  else
+    mode=compact
+    width=$(( cols - 13 ))
+  fi
+  if (( width < 8 )); then width=8; fi
+  if (( width > 60 )); then width=60; fi
+  spin="${spinners[$(( frame % ${#spinners[@]} ))]}"
+  bar=""
+  if (( total > 0 )); then
+    pct=$(( current * 100 / total ))
+    if (( pct > 100 )); then pct=100; fi
+    if (( pct < 0 )); then pct=0; fi
+    filled=$(( width * pct / 100 ))
+    if (( filled > width )); then filled=width; fi
+    for (( i=0; i<filled; i++ )); do
+      if [ "$use_color" = 1 ]; then
+        color_out="${rainbow[$(( (i + offset) % ${#rainbow[@]} ))]}"
+        bar+="${esc}[38;5;${color_out}m${bar_full}"
+      else
+        bar+="$bar_full"
+      fi
+    done
+    if (( filled < width )); then
+      bar+="$dim"
+      for (( i=filled; i<width; i++ )); do
+        bar+="$bar_empty"
+      done
+    fi
+    if [ "$use_color" = 1 ]; then bar+="$reset"; fi
+    printf -v pct_txt '%3d%%' "$pct"
+  else
+    head=$(( (frame * 2) % (width + 8) ))
+    for (( i=0; i<width; i++ )); do
+      if (( i >= head - 4 && i < head )); then
+        if [ "$use_color" = 1 ]; then
+          color_out="${rainbow[$(( (i + offset) % ${#rainbow[@]} ))]}"
+          bar+="${esc}[38;5;${color_out}m${bar_full}"
+        else
+          bar+="$bar_full"
+        fi
+      else
+        bar+="${dim}${bar_empty}"
+      fi
+    done
+    if [ "$use_color" = 1 ]; then bar+="$reset"; fi
+    pct_txt=" ?? "
+  fi
+  if (( speed > 0 )); then
+    speed_txt="$(human_size "$speed")/s"
+  else
+    speed_txt="--"
+  fi
+  if (( total > 0 )); then
+    size_txt="$(human_size "$current")/$(human_size "$total")"
+  else
+    size_txt="$(human_size "$current")"
+  fi
+  case "$mode" in
+    full)
+      printf '\r%s[K  %s%s%s %s  %s%s%s  %s%s%s  %s%s%s' "$esc" "$accent" "$spin" "$reset" "$bar" "$accent2" "$pct_txt" "$reset" "$accent2" "$speed_txt" "$reset" "$muted" "$size_txt" "$reset" >&2
+      ;;
+    medium)
+      printf '\r%s[K  %s%s%s %s  %s%s%s  %s%s%s' "$esc" "$accent" "$spin" "$reset" "$bar" "$accent2" "$pct_txt" "$reset" "$accent2" "$speed_txt" "$reset" >&2
+      ;;
+    compact)
+      printf '\r%s[K  %s%s%s %s  %s%s%s' "$esc" "$accent" "$spin" "$reset" "$bar" "$accent2" "$pct_txt" "$reset" >&2
+      ;;
+  esac
+}
+
+download() {
+  local url="$1" output="$2"
+  local total current last_size=0 speed=0 frame=0 offset=0 pid start last now dt inst elapsed_us avg
+  if [ ! -t 2 ] || [ -n "${OPENCODE_NO_PROGRESS:-}" ]; then
+    curl -fsSL --connect-timeout 10 -o "$output" "$url"
+    return $?
+  fi
+  download_cols="$(term_cols)"
+  total="$(content_length "$url")"
+  cursor_hidden=1
+  printf '%s' "${esc}[?25l" >&2
+  curl -fsSL --connect-timeout 10 -o "$output" "$url" 2>/dev/null &
+  pid=$!
+  start="$(now_us)"
+  last="$start"
+  while kill -0 "$pid" 2>/dev/null; do
+    current="$(file_size "$output")"
+    now="$(now_us)"
+    dt=$(( now - last ))
+    if (( dt >= 120000 )); then
+      inst=$(( (current - last_size) * 1000000 / dt ))
+      if (( inst < 0 )); then inst=0; fi
+      if (( speed == 0 )); then
+        speed="$inst"
+      else
+        speed=$(( (speed * 2 + inst) / 3 ))
+      fi
+      last="$now"
+      last_size="$current"
+    fi
+    if (( frame % 10 == 0 )); then
+      download_cols="$(term_cols)"
+    fi
+    render_progress "$current" "$total" "$speed" "$frame" "$offset"
+    frame=$(( frame + 1 ))
+    offset=$(( offset + 1 ))
+    sleep 0.1
+  done
+  if ! wait "$pid"; then
+    printf '\r%s[K  %s%s%s download failed\n' "$esc" "$bad" "$fail_mark" "$reset" >&2
+    cursor_hidden=""
+    printf '%s' "${esc}[?25h" >&2
+    return 1
+  fi
+  now="$(now_us)"
+  elapsed_us=$(( now - start ))
+  current="$(file_size "$output")"
+  if (( elapsed_us > 0 )); then
+    avg=$(( current * 1000000 / elapsed_us ))
+  else
+    avg=0
+  fi
+  printf '\r%s[K  %s%s%s Downloaded %s in %s (%s/s)\n' "$esc" "$good" "$ok_mark" "$reset" "$(human_size "$current")" "$(human_time $(( elapsed_us / 1000000 )))" "$(human_size "$avg")" >&2
+  cursor_hidden=""
+  printf '%s' "${esc}[?25h" >&2
+}
+
+latest_version() {
+  local metadata
+  metadata="$(curl -fsSL --connect-timeout 2 --max-time 5 "$api" 2>/dev/null || true)"
+  printf '%s' "$metadata" | sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
+}
+
+package_scope() {
+  local metadata package
+  metadata="$(curl -fsSL --connect-timeout 2 --max-time 5 "$api" 2>/dev/null || true)"
+  package="$(printf '%s' "$metadata" | sed -n 's/.*"package"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+  package="${package:-@opencode/cli}"
+  printf '%s\n' "${package%/cli}"
+}
+
+installed_version() {
+  local detected
+  if [ ! -x "$bin" ]; then return 1; fi
+  if [ -s "$version_file" ]; then
+    head -n1 "$version_file"
+    return 0
+  fi
+  detected="$("$bin" --version 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)+' | head -n1 || true)"
+  if [ -z "$detected" ]; then return 1; fi
+  mkdir -p "$home"
+  printf '%s\n' "$detected" > "$version_file" 2>/dev/null || true
+  printf '%s\n' "$detected"
+}
+
+version_gt() {
+  [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)" = "$1" ]
+}
+
+target_name() {
+  local arch target
+  case "$(uname -m)" in
+    x86_64|amd64) arch=x64 ;;
+    aarch64|arm64) arch=arm64 ;;
+    *) say "unsupported architecture $(uname -m)"; return 1 ;;
+  esac
+  target="linux-$arch"
+  if [ "$arch" = "x64" ] && ! grep -qwi avx2 /proc/cpuinfo 2>/dev/null; then
+    target="$target-baseline"
+  fi
+  if [ -f /etc/alpine-release ]; then
+    target="$target-musl"
+  fi
+  printf '%s\n' "$target"
+}
+
+fetch_registry_json() {
+  local out="$1" scope="$2" target="$3" url pid
+  url="${registry_base}/${scope}/cli-${target}"
+  if [ -t 2 ] && [ -z "${OPENCODE_NO_PROGRESS:-}" ]; then
+    curl -fsSL --connect-timeout 5 --max-time 30 -H 'Accept: application/vnd.npm.install-v1+json' -o "$out" "$url" 2>/dev/null &
+    pid=$!
+    spinner_wait "$pid" "Loading available versions"
+    wait "$pid"
+  else
+    curl -fsSL --connect-timeout 5 --max-time 30 -H 'Accept: application/vnd.npm.install-v1+json' -o "$out" "$url" 2>/dev/null
+  fi
+}
+
+list_versions() {
+  local scope target tmp
+  scope="$(package_scope)"
+  target="$(target_name)" || return 1
+  tmp="$(mktemp "${TMPDIR:-/tmp}/opencode-manager-versions.XXXXXX")"
+  if ! fetch_registry_json "$tmp" "$scope" "$target"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  grep -oE '"[0-9]+\.[0-9]+\.[0-9]+"' "$tmp" | tr -d '"' | sort -uVr
+  rm -f "$tmp"
+}
+
+install_version() {
+  local version="${1:-}" scope target url new
+  version="${version#v}"
+  case "$version" in
+    ""|*[!0-9A-Za-z.+-]*) say "invalid version '$version'"; return 1 ;;
+  esac
+  scope="$(package_scope)"
+  target="$(target_name)" || return 1
+  url="${registry_base}/${scope}/cli-${target}/-/cli-${target}-${version}.tgz"
+  tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/opencode-manager.XXXXXX")"
+  say "installing opencode ${version}"
+  if ! download "$url" "$tmp_dir/opencode.tgz"; then
+    say "failed to download ${url}"
+    rm -rf "$tmp_dir"
+    tmp_dir=""
+    return 1
+  fi
+  if ! tar -xzf "$tmp_dir/opencode.tgz" -C "$tmp_dir"; then
+    say "failed to extract ${url}"
+    rm -rf "$tmp_dir"
+    tmp_dir=""
+    return 1
+  fi
+  rm -f "$tmp_dir/opencode.tgz"
+  new="$tmp_dir/package/bin/opencode"
+  if [ ! -f "$new" ]; then
+    say "${url} did not contain package/bin/opencode"
+    rm -rf "$tmp_dir"
+    tmp_dir=""
+    return 1
+  fi
+  chmod 755 "$new"
+  if ! "$new" --version >/dev/null 2>&1; then
+    if [ -n "$loader" ] && command -v patchelf >/dev/null 2>&1; then
+      if ! patchelf --set-interpreter "$loader" "$new"; then
+        say "failed to patch the dynamic loader"
+        rm -rf "$tmp_dir"
+        tmp_dir=""
+        return 1
+      fi
+    fi
+  fi
+  if ! "$new" --version >/dev/null 2>&1; then
+    say "downloaded opencode ${version} does not run"
+    rm -rf "$tmp_dir"
+    tmp_dir=""
+    return 1
+  fi
+  mkdir -p "$home/bin"
+  if ! install -m755 "$new" "$home/bin/.opencode.new"; then
+    say "failed to write to ${home}/bin"
+    rm -rf "$tmp_dir"
+    tmp_dir=""
+    return 1
+  fi
+  mv -f "$home/bin/.opencode.new" "$bin"
+  printf '%s\n' "$version" > "$version_file"
+  rm -rf "$tmp_dir"
+  tmp_dir=""
+  say "opencode ${version} installed in ${home}"
+}
+
+select_version() {
+  local installed latest n i idx ver rows cols per top=0 selected=0 key ch seq do_install=0
+  local -a versions=()
+  installed="$(installed_version || true)"
+  latest="$(latest_version || true)"
+  mapfile -t versions < <(list_versions)
+  n=${#versions[@]}
+  if (( n == 0 )); then
+    say "could not load available versions"
+    return 1
+  fi
+  if [ ! -t 0 ] || [ ! -t 2 ]; then
+    printf '%s\n' "${versions[@]}"
+    return 0
+  fi
+  if [ -n "$installed" ]; then
+    for (( i=0; i<n; i++ )); do
+      if [ "${versions[i]}" = "$installed" ]; then
+        selected=$i
+        break
+      fi
+    done
+  fi
+  if ! saved_stty="$(stty -g < /dev/tty 2>/dev/null)"; then
+    say "cannot read terminal settings"
+    return 1
+  fi
+  alt_screen=1
+  cursor_hidden=1
+  printf '%s' "${esc}[?1049h${esc}[?25l" >&2
+  stty -echo -icanon min 1 time 0 < /dev/tty
+  while :; do
+    if ! read -r rows cols < <(stty size < /dev/tty 2>/dev/null); then
+      rows=24
+      cols=80
+    fi
+    case "$rows" in
+      ''|*[!0-9]*) rows=24 ;;
+    esac
+    case "$cols" in
+      ''|*[!0-9]*) cols=80 ;;
+    esac
+    if (( rows < 8 )); then rows=24; fi
+    if (( cols < 20 )); then cols=80; fi
+    per=$(( rows - 8 ))
+    if (( per < 4 )); then per=4; fi
+    if (( per > 15 )); then per=15; fi
+    if (( selected < top )); then top=$selected; fi
+    if (( selected >= top + per )); then top=$(( selected - per + 1 )); fi
+    if (( top > n - per )); then top=$(( n - per )); fi
+    if (( top < 0 )); then top=0; fi
+    printf '%s[H' "$esc" >&2
+    printf '  %s\n' "$(gradient_text 'opencode version manager' "$(( (selected + top) * 2 ))")" >&2
+    if [ -n "$installed" ]; then
+      printf '  %sinstalled%s %s   %slatest%s %s\n' "$muted" "$reset" "$installed" "$muted" "$reset" "${latest:-unknown}" >&2
+    else
+      printf '  %sinstalled%s none   %slatest%s %s\n' "$muted" "$reset" "$muted" "$reset" "${latest:-unknown}" >&2
+    fi
+    printf '\n' >&2
+    if (( top > 0 )); then
+      printf '  %s%s %d newer%s\n' "$muted" "↑" "$top" "$reset" >&2
+    else
+      printf '%s[K\n' "$esc" >&2
+    fi
+    for (( i=0; i<per; i++ )); do
+      idx=$(( top + i ))
+      if (( idx >= n )); then
+        printf '%s[K\n' "$esc" >&2
+        continue
+      fi
+      ver="${versions[idx]}"
+      if (( idx == selected )); then
+        printf '  %s%s%s %s%s%s%s%s' "$accent" "$pointer" "$reset" "$sel_bg" "$bold" "$ver" "$reset" "${esc}[K" >&2
+      else
+        printf '    %s%s%s' "$bold" "$ver" "$reset" >&2
+      fi
+      if [ "$ver" = "$latest" ]; then
+        printf '  %s%s%s' "$good" "latest" "$reset" >&2
+      fi
+      if [ "$ver" = "$installed" ]; then
+        printf '  %s%s%s' "$accent2" "installed" "$reset" >&2
+      fi
+      printf '\n' >&2
+    done
+    if (( top + per < n )); then
+      printf '  %s%s %d older%s\n' "$muted" "↓" "$(( n - top - per ))" "$reset" >&2
+    else
+      printf '%s[K\n' "$esc" >&2
+    fi
+    printf '\n  %s↑/↓%s choose   %senter%s install   %sq%s quit\n' "$accent2" "$reset" "$accent2" "$reset" "$accent2" "$reset" >&2
+    printf '%s[J' "$esc" >&2
+    key=""
+    if ! IFS= read -rsn1 key < /dev/tty; then
+      break
+    fi
+    if [ "$key" = $'\033' ]; then
+      seq=""
+      while (( ${#seq} < 4 )); do
+        if ! IFS= read -rsn1 -t 0.03 ch < /dev/tty; then
+          break
+        fi
+        seq+="$ch"
+        case "$seq" in
+          '[A'|'[B'|'[C'|'[D'|'[H'|'[F'|'OA'|'OB'|'OH'|'OF'|'[1~'|'[2~'|'[3~'|'[4~'|'[5~'|'[6~') break ;;
+        esac
+      done
+      case "$seq" in
+        '[A'|'OA') key=up ;;
+        '[B'|'OB') key=down ;;
+        '[H'|'OH'|'[1~') key=home ;;
+        '[F'|'OF'|'[4~') key=end ;;
+        '[5~') key=pgup ;;
+        '[6~') key=pgdn ;;
+        *) key=ignore ;;
+      esac
+    fi
+    case "$key" in
+      up|k) selected=$(( (selected - 1 + n) % n )) ;;
+      down|j) selected=$(( (selected + 1) % n )) ;;
+      pgup) if (( selected - per < 0 )); then selected=0; else selected=$(( selected - per )); fi ;;
+      pgdn) if (( selected + per >= n )); then selected=$(( n - 1 )); else selected=$(( selected + per )); fi ;;
+      home|g) selected=0 ;;
+      end|G) selected=$(( n - 1 )) ;;
+      q|Q) break ;;
+      '') do_install=1; break ;;
+    esac
+  done
+  stty "$saved_stty" < /dev/tty 2>/dev/null || true
+  saved_stty=""
+  printf '%s' "${esc}[?25h${esc}[?1049l" >&2
+  cursor_hidden=""
+  alt_screen=""
+  if (( do_install )); then
+    ver="${versions[selected]}"
+    if [ "$ver" = "$installed" ]; then
+      say "opencode ${ver} is already installed"
+      return 0
+    fi
+    install_version "$ver"
+  fi
+}
+
+usage() {
+  cat >&2 <<'EOF'
+usage: opencode-manager [command] [version]
+
+commands:
+  select            interactive version picker (default)
+  status            show installed and latest versions
+  versions          list installable stable versions
+  update [version]  install the latest or a specific version
+  install <version> install a specific version
+  check             print the latest version; exit 0 if an update is available
+  version           print the installed version
+  path              print the installed binary path
+  help              show this help
+EOF
+}
+
+if [ -n "${OPENCODE_MANAGER_MODE:-}" ]; then
+  cmd="${1:-}"
+  if [ -z "$cmd" ]; then
+    if [ -t 0 ] && [ -t 2 ]; then
+      cmd=select
+    else
+      cmd=status
+    fi
+  fi
+  case "$cmd" in
+    select|choose)
+      select_version
+      ;;
+    status)
+      installed="$(installed_version || true)"
+      latest="$(latest_version)"
+      printf 'home: %s\n' "$home"
+      printf 'installed: %s\n' "${installed:-not installed}"
+      printf 'latest: %s\n' "${latest:-unknown}"
+      if [ -n "$installed" ] && [ -n "$latest" ]; then
+        if version_gt "$latest" "$installed"; then
+          printf 'update: available (%s -> %s)\n' "$installed" "$latest"
+        else
+          printf 'update: none\n'
+        fi
+      fi
+      ;;
+    versions)
+      list_versions || { say "could not load available versions"; exit 1; }
+      ;;
+    update|install)
+      target="${2:-latest}"
+      if [ "$target" = "latest" ]; then
+        target="$(latest_version)"
+        if [ -z "$target" ]; then
+          say "could not determine the latest version"
+          exit 1
+        fi
+      fi
+      install_version "$target"
+      ;;
+    check)
+      installed="$(installed_version || true)"
+      latest="$(latest_version)"
+      if [ -z "$latest" ]; then
+        say "could not determine the latest version"
+        exit 2
+      fi
+      printf '%s\n' "$latest"
+      if [ -n "$installed" ] && ! version_gt "$latest" "$installed"; then
+        exit 1
+      fi
+      exit 0
+      ;;
+    version)
+      installed_version || { printf 'not installed\n'; exit 1; }
+      ;;
+    path)
+      printf '%s\n' "$bin"
+      ;;
+    help|-h|--help)
+      usage
+      ;;
+    *)
+      usage
+      exit 1
+      ;;
+  esac
+  exit 0
+fi
+
+installed="$(installed_version || true)"
+
+if [ -z "$installed" ]; then
+  latest="$(latest_version)"
+  if [ -z "$latest" ]; then
+    say "opencode is not installed and the latest version could not be determined"
+    exit 1
+  fi
+  install_version "$latest"
+  installed="$latest"
+fi
+
+case "${1:-}" in
+  -v|--version|-h|--help)
+    export OPENCODE_MANAGER_CHILD=1
+    export OPENCODE_DISABLE_AUTOUPDATE=1
+    exec "$bin" "$@"
+    ;;
+esac
+
+if [ -z "${OPENCODE_MANAGER_CHILD:-}" ] && ! is_on "${OPENCODE_NO_UPDATE:-}"; then
+  if [ -t 0 ] || is_on "${OPENCODE_AUTO_UPDATE:-}"; then
+    latest="$(latest_version)"
+    if [ -n "$latest" ] && version_gt "$latest" "$installed"; then
+      do_update=0
+      if is_on "${OPENCODE_AUTO_UPDATE:-}"; then
+        do_update=1
+      elif [ -t 0 ] && [ -t 2 ]; then
+        printf '%sopencode %s%s is available (installed %s). Update? [y/N] ' "$warn" "$latest" "$reset" "$installed" >&2
+        answer=""
+        read -r answer || answer=""
+        case "$answer" in [yY]*) do_update=1 ;; esac
+      fi
+      if [ "$do_update" = "1" ]; then
+        if install_version "$latest"; then
+          installed="$latest"
+        else
+          say "update failed; continuing with ${installed}"
+        fi
+      fi
+    fi
+  fi
+fi
+
+export OPENCODE_MANAGER_CHILD=1
+export OPENCODE_DISABLE_AUTOUPDATE=1
+exec "$bin" "$@"
